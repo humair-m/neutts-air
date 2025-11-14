@@ -1,18 +1,46 @@
-# run info
+# -------------------------------------------------
+# Run info
+# -------------------------------------------------
 restore_from: "HuggingFaceTB/SmolLM-135M"
 save_root: "/data"
 run_name: "neutts-finetune"
 
-# model info
-codebook_size: 65536 # xcodec
+# -------------------------------------------------
+# Model info
+# -------------------------------------------------
+codebook_size: 65536      # for xcodec
 max_seq_len: 2048
-lr: 0.00004
+lr: 0.0004
 lr_scheduler_type: "cosine"
-warmup_ratio: 0.00
+warmup_ratio: 0.0
+use_fp16: true
 
-# train info
+# -------------------------------------------------
+# Train info
+# -------------------------------------------------
 per_device_train_batch_size: 2
 max_steps: 10000
 logging_steps: 100
 save_steps: 20000
 seed: 1337
+dataloader_num_workers: 8
+
+# -------------------------------------------------
+# Dataset configuration
+# -------------------------------------------------
+data:
+  start: 1                # Start shard (inclusive)
+  end: 19                 # End shard (inclusive)
+  total_shards: 241       # Total number of shards in dataset
+  prefix: "train"         # Shard prefix
+  use_hf_hub: false       # Set to true to download from HF Hub
+  local_dir: "./data"     # Local directory containing parquet shards
+  # hf_base: "https://huggingface.co/datasets/neuphonic/emilia-yodas-english-neucodec/resolve/main"
+
+# -------------------------------------------------
+# Misaki G2P configuration
+# -------------------------------------------------
+misaki:
+  use_transformer: false  # Use transformer-based G2P (slower but more accurate)
+  british: false          # Use British English pronunciation
+  fallback: null          # Set to "espeak" to enable espeak fallback (requires espeak-ng installed)

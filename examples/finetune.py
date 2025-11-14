@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-train_with_misaki_espeak.py
+train_with_misaki_shards.py
 
-Same training pipeline as before, but Misaki G2P is instantiated with an optional
-espeak/espeak-ng fallback when enabled in the config (misaki.fallback = "espeak").
+- Loads only a contiguous range of parquet shards from the emilia dataset (start..end inclusive)
+  - If local_dir is provided in config, reads files from there.
+  - Otherwise downloads shards from HF Hub (base URL is set by default).
+- Uses Misaki G2P with optional espeak fallback (enable via config).
+- Safe token/special-token handling and hf.datasets-friendly preprocess (returns lists).
+- Training using HuggingFace Trainer.
 
 Usage:
-    python train_with_misaki_espeak.py config.yaml
+    python train_with_misaki_shards.py config.yaml
 """
-import warnings
-import re
 import os
+import re
 import shutil
+import warnings
 from functools import partial
+
 from omegaconf import OmegaConf
 from loguru import logger as LOGGER
 
+warnings.filterwarnings("ignore")
+
+# ML libs
 import torch
 from transformers import (
     AutoTokenizer,
@@ -26,20 +34,32 @@ from transformers import (
 )
 from datasets import load_dataset
 
-warnings.filterwarnings("ignore")
-
-# === Misaki imports ===
+# Misaki (English). If misaki not installed this will raise early.
 try:
-    # primary misaki modules
     from misaki import en as misaki_en
-    from misaki import espeak as misaki_espeak  # this module provides EspeakFallback
 except Exception as e:
     LOGGER.error("Failed to import misaki. Install with: pip install \"misaki[en]\"")
     raise
 
-# --- convenience ---
+# Regexes for filtering
 ACRONYM = re.compile(r"(?:[a-zA-Z]\.){2,}")
 ACRONYM_NO_PERIOD = re.compile(r"(?:[A-Z]){3,}")
+
+
+def make_shard_filenames(start_idx: int, end_idx: int, prefix="train", total_shards=241):
+    """Return list of shard file names (zero-padded). start/end inclusive. Example: train-00001-of-00241.parquet."""
+    # validate
+    if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
+        raise ValueError("Invalid start/end indices")
+    return [f"{prefix}-{i:05d}-of-{total_shards:05d}.parquet" for i in range(start_idx, end_idx + 1)]
+
+
+def _detect_espeak_binary():
+    """Look for either 'espeak-ng' or 'espeak' on PATH. Return binary name or None."""
+    for name in ("espeak-ng", "espeak"):
+        if shutil.which(name):
+            return name
+    return None
 
 
 def data_filter(sample):
@@ -59,7 +79,7 @@ def data_filter(sample):
 
 def preprocess_sample(sample, tokenizer, max_len, g2p):
     """
-    Return Python lists (not tensors) for hf.datasets.map compatibility.
+    Return Python lists (not torch tensors) for datasets.map compatibility.
     g2p callable -> (phonemes, tokens) = g2p(text)
     """
     speech_gen_start_tok = "<|SPEECH_GENERATION_START|>"
@@ -70,7 +90,7 @@ def preprocess_sample(sample, tokenizer, max_len, g2p):
     text = sample.get("text", "")
 
     try:
-        phonemes, toks = g2p(text)
+        phonemes, _tokens = g2p(text)
     except Exception as e:
         LOGGER.warning(f"g2p failed for sample {sample.get('__key__')}: {e}")
         return None
@@ -109,39 +129,48 @@ def preprocess_sample(sample, tokenizer, max_len, g2p):
         start_idx = ids.index(speech_gen_start_id)
         labels[start_idx:] = ids[start_idx:]
     except ValueError:
-        # not found: leave labels as -100
         LOGGER.debug("speech start token not found in tokenized ids")
 
     attention_mask = [0 if x == pad_id else 1 for x in ids]
-
     return {"input_ids": ids, "labels": labels, "attention_mask": attention_mask}
 
 
-def _detect_espeak_binary():
+def load_selected_shards(config, start_idx: int, end_idx: int):
     """
-    Look for either 'espeak-ng' or 'espeak' on PATH. Return binary name or None.
+    Load dataset shards either from local_dir or HF hub.
+    Returns a datasets.Dataset object (split 'train').
     """
-    for name in ("espeak-ng", "espeak"):
-        if shutil.which(name):
-            return name
-    return None
+    total_shards = config.get("data", {}).get("total_shards", 241)
+    prefix = config.get("data", {}).get("prefix", "train")
+    names = make_shard_filenames(start_idx, end_idx, prefix=prefix, total_shards=total_shards)
+
+    use_hf_hub = config.get("data", {}).get("use_hf_hub", False)
+    if use_hf_hub:
+        base = config.get("data", {}).get(
+            "hf_base",
+            "https://huggingface.co/datasets/neuphonic/emilia-yodas-english-neucodec/resolve/main",
+        )
+        urls = [f"{base}/{n}" for n in names]
+        LOGGER.info(f"Loading {len(urls)} shards from HF Hub (HTTP).")
+        ds = load_dataset("parquet", data_files=urls, split="train")
+    else:
+        local_dir = config.get("data", {}).get("local_dir", "./data")
+        paths = [os.path.join(local_dir, n) for n in names]
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            LOGGER.error("Missing local shard files. Missing examples:\n" + "\n".join(missing))
+            raise FileNotFoundError(f"Missing shard files. Check data.local_dir in config. Missing {len(missing)} files.")
+        LOGGER.info(f"Loading {len(paths)} local parquet shards from {local_dir}")
+        ds = load_dataset("parquet", data_files=paths, split="train")
+
+    return ds
 
 
-def main(config_fpath: str):
-    print(f"Loading config from {config_fpath}")
-    config = OmegaConf.load(config_fpath)
-
-    checkpoints_dir = os.path.join(config.save_root, config.run_name)
-    LOGGER.info(f"Logging to: {checkpoints_dir}")
-
-    restore_from = config.restore_from
-    print(f"Loading checkpoint from {restore_from}")
-
-    # tokenizer & model
+def setup_tokenizer_and_model(restore_from):
     tokenizer = AutoTokenizer.from_pretrained(restore_from, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(restore_from, torch_dtype="auto")
 
-    # ensure pad token
+    # ensure pad token exists
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is not None:
             tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
@@ -150,7 +179,6 @@ def main(config_fpath: str):
             tokenizer.add_special_tokens({"pad_token": "[PAD]"})
             LOGGER.info("Added [PAD] as pad token")
 
-    # special tokens used by the prompt
     special_tokens = {
         "additional_special_tokens": [
             "<|TEXT_PROMPT_START|>",
@@ -165,50 +193,81 @@ def main(config_fpath: str):
         model.resize_token_embeddings(len(tokenizer))
         LOGGER.info(f"Added {added} special tokens and resized model embeddings.")
 
-    # --- Misaki G2P + optional espeak fallback ---
-    misaki_cfg = getattr(config, "misaki", {}) or {}
+    return tokenizer, model
+
+
+def build_g2p_from_config(misaki_cfg):
+    """
+    Create misaki_en.G2P(...) instance using config dict:
+       misaki_cfg: {use_transformer: bool, british: bool, fallback: "espeak" or None}
+    If fallback is "espeak", try to instantiate misaki.espeak.EspeakFallback (lazily imported).
+    """
     use_trf = bool(misaki_cfg.get("use_transformer", False))
     british = bool(misaki_cfg.get("british", False))
-    fallback_opt = misaki_cfg.get("fallback", None)  # expect "espeak" or None
+    fallback_opt = misaki_cfg.get("fallback", None)
 
     fallback_obj = None
-    if fallback_opt:
-        if str(fallback_opt).lower() == "espeak":
+    if fallback_opt and str(fallback_opt).lower() == "espeak":
+        # lazy import misaki.espeak (some installs may not have this submodule)
+        try:
+            from misaki import espeak as misaki_espeak
             bin_name = _detect_espeak_binary()
-            if bin_name is None:
-                LOGGER.warning(
-                    "espeak/espeak-ng binary not found on PATH. Install espeak-ng (system package) "
-                    "or set misaki.fallback=null in config if you don't want fallback."
-                )
-            # misaki exposes an espeak helper module; create the fallback object if available
             try:
-                # EspeakFallback signature: EspeakFallback(british=bool, program_name=None, ...)
-                # If binary name detected, pass it as program_name to be explicit.
                 if bin_name:
                     fallback_obj = misaki_espeak.EspeakFallback(british=british, program_name=bin_name)
                 else:
-                    # still try to create fallback (misaki will attempt default program)
                     fallback_obj = misaki_espeak.EspeakFallback(british=british)
-                LOGGER.info("Created Misaki EspeakFallback (will be used for OOD tokens).")
+                LOGGER.info("Created Misaki EspeakFallback for G2P fallback.")
             except Exception as e:
-                LOGGER.warning(f"Failed to create Misaki EspeakFallback: {e}. Continuing without fallback.")
+                LOGGER.warning(f"Failed to instantiate EspeakFallback: {e}. Continuing without fallback.")
                 fallback_obj = None
-        else:
-            LOGGER.warning(f"Unknown misaki.fallback='{fallback_opt}' — supported: 'espeak' or null")
+        except Exception as e:
+            LOGGER.warning(f"misaki.espeak submodule not available: {e}. Install optional deps or skip fallback.")
+            fallback_obj = None
 
-    # instantiate G2P
+    # instantiate main G2P
     try:
         g2p = misaki_en.G2P(trf=use_trf, british=british, fallback=fallback_obj)
     except Exception as e:
         LOGGER.error(f"Failed to initialize misaki.en.G2P: {e}")
         raise
+    return g2p
 
-    partial_preprocess = partial(preprocess_sample, tokenizer=tokenizer, max_len=config.max_seq_len, g2p=g2p)
 
-    # dataset
-    emilia_dataset = load_dataset("neuphonic/emilia-yodas-english-neucodec", split="train[:2000]")
-    emilia_dataset = emilia_dataset.filter(data_filter)
-    emilia_dataset = emilia_dataset.map(partial_preprocess, remove_columns=["text", "codes"], batched=False)
+def main(config_path):
+    # Load config
+    config = OmegaConf.load(config_path)
+
+    # required config fields & defaults
+    start = int(config.get("data", {}).get("start", 1))
+    end = int(config.get("data", {}).get("end", 19))
+    if end < start:
+        raise ValueError("data.end must be >= data.start")
+
+    LOGGER.info(f"Requested shard range: {start} .. {end}")
+
+    # load only selected shards
+    ds = load_selected_shards(config, start, end)
+    LOGGER.info(f"Loaded dataset with {len(ds)} examples from selected shards.")
+
+    # filter if user wants
+    ds = ds.filter(data_filter)
+
+    # tokenizer + model
+    restore_from = config.get("restore_from")
+    tokenizer, model = setup_tokenizer_and_model(restore_from)
+
+    # misaki G2P
+    misaki_cfg = config.get("misaki", {}) or {}
+    g2p = build_g2p_from_config(misaki_cfg)
+
+    # map preprocess
+    partial_pre = partial(preprocess_sample, tokenizer=tokenizer, max_len=config.max_seq_len, g2p=g2p)
+    ds = ds.map(partial_pre, remove_columns=["text", "codes"], batched=False)
+
+    # training args
+    checkpoints_dir = os.path.join(config.save_root, config.run_name)
+    LOGGER.info(f"Checkpoints will be saved to: {checkpoints_dir}")
 
     training_args = TrainingArguments(
         output_dir=checkpoints_dir,
@@ -231,15 +290,19 @@ def main(config_fpath: str):
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        train_dataset=emilia_dataset,
+        train_dataset=ds,
         data_collator=default_data_collator,
     )
 
     trainer.train()
     trainer.save_model(checkpoints_dir)
-    LOGGER.info("Training done and model saved.")
+    LOGGER.info("Training complete and model saved.")
 
 
 if __name__ == "__main__":
-    from fire import Fire
-    Fire(main)
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python train_with_misaki_shards.py config.yaml")
+        sys.exit(1)
+    cfg_path = sys.argv[1]
+    main(cfg_path)

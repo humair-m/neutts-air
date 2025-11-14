@@ -1,5 +1,5 @@
 # run info
-restore_from: "neuphonic/neutts-air"
+restore_from: "HuggingFaceTB/SmolLM-135M"
 save_root: "/data"
 run_name: "neutts-finetune"
 

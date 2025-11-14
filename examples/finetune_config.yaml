@@ -33,7 +33,7 @@ data:
   end: 19                 # End shard (inclusive)
   total_shards: 241       # Total number of shards in dataset
   prefix: "train"         # Shard prefix
-  use_hf_hub: false       # Set to true to download from HF Hub
+  use_hf_hub: true       # Set to true to download from HF Hub
   local_dir: "./data"     # Local directory containing parquet shards
   # hf_base: "https://huggingface.co/datasets/neuphonic/emilia-yodas-english-neucodec/resolve/main"
 

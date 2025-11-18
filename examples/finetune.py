@@ -1,213 +1,195 @@
 #!/usr/bin/env python3
 """
-train_with_misaki_shards.py
+train_optimized.py
 
-Optimized training script with:
-- Fast batched preprocessing with multiprocessing
-- Efficient shard loading
-- Better error handling
-- Progress tracking
+High-performance training script with:
+- Ultra-fast parallel tokenization
+- Efficient memory management
+- Optimized batch processing
+- Better error handling and logging
 
 Usage:
-    python train_with_misaki_shards.py config.yaml
+    python train_optimized.py config.yaml
 """
 import os
 import re
 import sys
 import shutil
 import warnings
-from functools import partial
-from typing import Dict, List, Any
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Suppress warnings early
+# Suppress warnings
 warnings.filterwarnings("ignore")
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"  # Enable for fast tokenizers
 
 from omegaconf import OmegaConf
-from loguru import logger as LOGGER
+from loguru import logger
 
-# ML libs
 import torch
+import torch.distributed as dist
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
-    default_data_collator,
+    DataCollatorWithPadding,
 )
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, concatenate_datasets
 from tqdm.auto import tqdm
+import numpy as np
 
 # Misaki G2P
 try:
     from misaki import en as misaki_en
-except Exception as e:
-    LOGGER.error("Failed to import misaki. Install with: pip install \"misaki[en]\"")
+except ImportError as e:
+    logger.error("Failed to import misaki. Install with: pip install 'misaki[en]'")
     raise
 
-# Regexes for filtering
-ACRONYM = re.compile(r"(?:[a-zA-Z]\.){2,}")
-ACRONYM_NO_PERIOD = re.compile(r"(?:[A-Z]){3,}")
+# Compiled regex patterns for speed
+PATTERNS = {
+    "digit": re.compile(r"\d"),
+    "acronym": re.compile(r"(?:[a-zA-Z]\.){2,}"),
+    "acronym_no_period": re.compile(r"(?:[A-Z]){3,}"),
+    "currency": re.compile(r"[£$€¥]"),
+}
 
 
-def make_shard_filenames(start_idx: int, end_idx: int, prefix="train", total_shards=241):
-    """Generate shard filenames (zero-padded). start/end inclusive."""
-    if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
-        raise ValueError(f"Invalid shard range: {start_idx}-{end_idx}")
-    return [f"{prefix}-{i:05d}-of-{total_shards:05d}.parquet" for i in range(start_idx, end_idx + 1)]
-
-
-def _detect_espeak_binary():
-    """Look for espeak-ng or espeak on PATH."""
-    for name in ("espeak-ng", "espeak"):
-        if shutil.which(name):
-            return name
-    return None
-
-
-def data_filter(sample: Dict) -> bool:
-    """Fast filtering of invalid samples."""
-    text = sample.get("text", "")
-    if not text or len(text) < 5:
-        return False
-    if re.search(r"\d", text):
-        return False
-    if re.search(ACRONYM, text) or re.search(ACRONYM_NO_PERIOD, text):
-        return False
-    if text[-1] not in ".,?!":
-        return False
-    if "£" in text or "$" in text:
-        return False
-    return True
-
-
-def preprocess_batch(batch: Dict, tokenizer, max_len: int, g2p, ignore_index: int = -100):
-    """
-    Batched preprocessing for speed.
-    Returns dict with lists of input_ids, labels, attention_mask.
-    """
-    batch_size = len(batch["text"])
+@dataclass
+class TrainingConfig:
+    """Structured config holder."""
+    # Data
+    start_shard: int
+    end_shard: int
+    total_shards: int = 241
+    shard_prefix: str = "train"
+    local_dir: Optional[str] = None
+    hf_dataset_name: Optional[str] = None
+    use_hf_hub: bool = False
     
-    all_input_ids = []
-    all_labels = []
-    all_attention_mask = []
+    # Model
+    restore_from: str = None
+    max_seq_len: int = 2048
     
-    speech_gen_start_tok = "<|SPEECH_GENERATION_START|>"
-    speech_gen_start_id = tokenizer.convert_tokens_to_ids(speech_gen_start_tok)
-    pad_id = tokenizer.pad_token_id
+    # Processing
+    num_proc: int = 8
+    map_batch_size: int = 2000
+    filter_batch_size: int = 10000
     
-    for i in range(batch_size):
-        text = batch["text"][i]
-        vq_codes = batch["codes"][i]
+    # Training
+    run_name: str = "experiment"
+    save_root: str = "./checkpoints"
+    lr: float = 5e-5
+    max_steps: int = 10000
+    per_device_train_batch_size: int = 4
+    gradient_accumulation_steps: int = 4
+    warmup_ratio: float = 0.1
+    save_steps: int = 500
+    logging_steps: int = 10
+    save_total_limit: int = 3
+    gradient_checkpointing: bool = True
+    bf16: bool = True
+    dataloader_num_workers: int = 4
+    optimizer: str = "adamw_torch"
+    lr_scheduler_type: str = "cosine"
+    
+    # G2P
+    use_transformer_g2p: bool = False
+    british_english: bool = False
+    use_espeak_fallback: bool = False
+    
+    @classmethod
+    def from_omega(cls, cfg: OmegaConf):
+        """Create from OmegaConf."""
+        data_cfg = cfg.get("data", {})
+        misaki_cfg = cfg.get("misaki", {})
         
-        # G2P conversion
-        try:
-            phonemes, _ = g2p(text)
-            if not phonemes:
-                continue
-            phones = " ".join(str(phonemes).split())
-        except Exception:
-            continue
-        
-        # Build prompt
-        codes_str = "".join([f"<|speech_{code}|>" for code in vq_codes])
-        chat = (
-            "user: Convert the text to speech:"
-            "<|TEXT_PROMPT_START|>"
-            f"{phones}"
-            "<|TEXT_PROMPT_END|>\n"
-            "assistant:"
-            f"{speech_gen_start_tok}"
-            f"{codes_str}<|SPEECH_GENERATION_END|>"
+        return cls(
+            start_shard=int(data_cfg.get("start", 1)),
+            end_shard=int(data_cfg.get("end", 19)),
+            total_shards=int(data_cfg.get("total_shards", 241)),
+            shard_prefix=data_cfg.get("prefix", "train"),
+            local_dir=data_cfg.get("local_dir"),
+            hf_dataset_name=data_cfg.get("hf_dataset_name"),
+            use_hf_hub=bool(data_cfg.get("use_hf_hub", False)),
+            restore_from=cfg.get("restore_from"),
+            max_seq_len=int(cfg.get("max_seq_len", 2048)),
+            num_proc=int(cfg.get("num_proc", 8)),
+            map_batch_size=int(cfg.get("map_batch_size", 2000)),
+            filter_batch_size=int(cfg.get("filter_batch_size", 10000)),
+            run_name=cfg.get("run_name", "experiment"),
+            save_root=cfg.get("save_root", "./checkpoints"),
+            lr=float(cfg.get("lr", 5e-5)),
+            max_steps=int(cfg.get("max_steps", 10000)),
+            per_device_train_batch_size=int(cfg.get("per_device_train_batch_size", 4)),
+            gradient_accumulation_steps=int(cfg.get("gradient_accumulation_steps", 4)),
+            warmup_ratio=float(cfg.get("warmup_ratio", 0.1)),
+            save_steps=int(cfg.get("save_steps", 500)),
+            logging_steps=int(cfg.get("logging_steps", 10)),
+            save_total_limit=int(cfg.get("save_total_limit", 3)),
+            gradient_checkpointing=bool(cfg.get("gradient_checkpointing", True)),
+            bf16=bool(cfg.get("bf16", True)),
+            dataloader_num_workers=int(cfg.get("dataloader_num_workers", 4)),
+            optimizer=cfg.get("optimizer", "adamw_torch"),
+            lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine"),
+            use_transformer_g2p=bool(misaki_cfg.get("use_transformer", False)),
+            british_english=bool(misaki_cfg.get("british", False)),
+            use_espeak_fallback=bool(misaki_cfg.get("fallback") == "espeak"),
         )
+
+
+class FastG2PProcessor:
+    """Fast G2P processor with caching."""
+    
+    def __init__(self, config: TrainingConfig):
+        self.config = config
+        self.g2p = self._setup_g2p()
+        self._cache = {}
+    
+    def _setup_g2p(self):
+        """Initialize G2P with optional fallback."""
+        fallback = None
+        if self.config.use_espeak_fallback:
+            try:
+                from misaki import espeak as misaki_espeak
+                bin_name = shutil.which("espeak-ng") or shutil.which("espeak")
+                if bin_name:
+                    fallback = misaki_espeak.EspeakFallback(
+                        british=self.config.british_english,
+                        program_name=bin_name
+                    )
+                    logger.info(f"Enabled espeak fallback: {bin_name}")
+            except Exception as e:
+                logger.warning(f"Espeak fallback failed: {e}")
         
-        # Tokenize
-        enc = tokenizer(chat, add_special_tokens=False)
-        ids = enc["input_ids"]
+        return misaki_en.G2P(
+            trf=self.config.use_transformer_g2p,
+            british=self.config.british_english,
+            fallback=fallback
+        )
+    
+    def process(self, text: str) -> Optional[str]:
+        """Convert text to phonemes with caching."""
+        if text in self._cache:
+            return self._cache[text]
         
-        # Pad or truncate
-        if len(ids) < max_len:
-            ids = ids + [pad_id] * (max_len - len(ids))
-        else:
-            ids = ids[:max_len]
-        
-        # Create labels (only supervise after speech generation start)
-        labels = [ignore_index] * len(ids)
         try:
-            start_idx = ids.index(speech_gen_start_id)
-            labels[start_idx:] = ids[start_idx:]
-        except ValueError:
-            pass
-        
-        attention_mask = [0 if x == pad_id else 1 for x in ids]
-        
-        all_input_ids.append(ids)
-        all_labels.append(labels)
-        all_attention_mask.append(attention_mask)
-    
-    return {
-        "input_ids": all_input_ids,
-        "labels": all_labels,
-        "attention_mask": all_attention_mask,
-    }
+            phonemes, _ = self.g2p(text)
+            if not phonemes:
+                return None
+            result = " ".join(str(phonemes).split())
+            self._cache[text] = result
+            return result
+        except Exception:
+            return None
 
 
-def load_selected_shards(config, start_idx: int, end_idx: int) -> Dataset:
-    """Load dataset shards from local or HF Hub."""
-    total_shards = config.get("data", {}).get("total_shards", 241)
-    prefix = config.get("data", {}).get("prefix", "train")
-    names = make_shard_filenames(start_idx, end_idx, prefix=prefix, total_shards=total_shards)
+class FastTokenizer:
+    """Optimized tokenizer with batch processing."""
     
-    use_hf_hub = config.get("data", {}).get("use_hf_hub", False)
-    
-    if use_hf_hub:
-        dataset_name = config.get("data", {}).get("hf_dataset_name", "neuphonic/emilia-yodas-english-neucodec")
-        LOGGER.info(f"Loading from HF Hub: {dataset_name}")
-        
-        # Load full dataset (shards are already combined in HF datasets)
-        ds = load_dataset(dataset_name, split="train", streaming=False)
-        LOGGER.info(f"Loaded {len(ds)} examples from HF Hub")
-        
-    else:
-        local_dir = config.get("data", {}).get("local_dir", "./data")
-        paths = [os.path.join(local_dir, n) for n in names]
-        
-        # Check for missing files
-        missing = [p for p in paths if not os.path.exists(p)]
-        if missing:
-            LOGGER.error(f"Missing {len(missing)} shard files:")
-            for p in missing[:3]:
-                LOGGER.error(f"  - {p}")
-            raise FileNotFoundError(f"Missing shard files in {local_dir}")
-        
-        LOGGER.info(f"Loading {len(paths)} local shards from {local_dir}")
-        ds = load_dataset("parquet", data_files=paths, split="train")
-    
-    return ds
-
-
-def setup_tokenizer_and_model(restore_from: str):
-    """Initialize tokenizer and model with special tokens."""
-    LOGGER.info(f"Loading tokenizer and model from: {restore_from}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(restore_from, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        restore_from, 
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
-    )
-    
-    # Setup pad token
-    if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
-            LOGGER.info("Set pad_token = eos_token")
-        else:
-            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-            LOGGER.info("Added [PAD] as pad token")
-    
-    # Add special tokens
-    special_tokens = {
+    SPECIAL_TOKENS = {
         "additional_special_tokens": [
             "<|TEXT_PROMPT_START|>",
             "<|TEXT_PROMPT_END|>",
@@ -217,147 +199,330 @@ def setup_tokenizer_and_model(restore_from: str):
         ]
     }
     
-    num_added = tokenizer.add_special_tokens(special_tokens)
-    if num_added > 0:
-        model.resize_token_embeddings(len(tokenizer))
-        LOGGER.info(f"Added {num_added} special tokens and resized embeddings")
+    def __init__(self, tokenizer_path: str):
+        logger.info(f"Loading tokenizer from: {tokenizer_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            use_fast=True,  # Use fast Rust-based tokenizer
+            padding_side="right",
+        )
+        self._setup_special_tokens()
+        
+        # Cache special token IDs
+        self.pad_id = self.tokenizer.pad_token_id
+        self.speech_start_id = self.tokenizer.convert_tokens_to_ids(
+            "<|SPEECH_GENERATION_START|>"
+        )
     
-    return tokenizer, model
-
-
-def build_g2p_from_config(misaki_cfg: Dict) -> Any:
-    """Create Misaki G2P instance with optional espeak fallback."""
-    use_trf = bool(misaki_cfg.get("use_transformer", False))
-    british = bool(misaki_cfg.get("british", False))
-    fallback_opt = misaki_cfg.get("fallback", None)
-    
-    fallback_obj = None
-    if fallback_opt and str(fallback_opt).lower() == "espeak":
-        try:
-            from misaki import espeak as misaki_espeak
-            bin_name = _detect_espeak_binary()
-            if bin_name:
-                fallback_obj = misaki_espeak.EspeakFallback(british=british, program_name=bin_name)
-                LOGGER.info(f"Created EspeakFallback with binary: {bin_name}")
+    def _setup_special_tokens(self):
+        """Add special tokens and setup padding."""
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
             else:
-                LOGGER.warning("espeak binary not found, continuing without fallback")
-        except Exception as e:
-            LOGGER.warning(f"Failed to setup EspeakFallback: {e}")
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        
+        num_added = self.tokenizer.add_special_tokens(self.SPECIAL_TOKENS)
+        logger.info(f"Added {num_added} special tokens")
     
-    g2p = misaki_en.G2P(trf=use_trf, british=british, fallback=fallback_obj)
-    LOGGER.info(f"Initialized Misaki G2P (transformer={use_trf}, british={british})")
-    return g2p
+    def build_prompt(self, phonemes: str, vq_codes: List[int]) -> str:
+        """Build training prompt."""
+        codes_str = "".join([f"<|speech_{c}|>" for c in vq_codes])
+        return (
+            "user: Convert the text to speech:"
+            "<|TEXT_PROMPT_START|>"
+            f"{phonemes}"
+            "<|TEXT_PROMPT_END|>\n"
+            "assistant:"
+            "<|SPEECH_GENERATION_START|>"
+            f"{codes_str}<|SPEECH_GENERATION_END|>"
+        )
+    
+    def tokenize_batch(
+        self,
+        prompts: List[str],
+        max_length: int,
+        return_labels: bool = True
+    ) -> Dict[str, List[List[int]]]:
+        """Fast batch tokenization using HF's batch_encode_plus."""
+        # Use fast batch encoding
+        encoded = self.tokenizer.batch_encode_plus(
+            prompts,
+            add_special_tokens=False,
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_attention_mask=True,
+            return_tensors=None,  # Return lists for flexibility
+        )
+        
+        result = {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+        }
+        
+        if return_labels:
+            # Create labels (supervise only after speech generation start)
+            labels = []
+            for ids in encoded["input_ids"]:
+                label = [-100] * len(ids)
+                try:
+                    start_idx = ids.index(self.speech_start_id)
+                    label[start_idx:] = ids[start_idx:]
+                except ValueError:
+                    pass
+                labels.append(label)
+            result["labels"] = labels
+        
+        return result
+
+
+def fast_filter(batch: Dict, batch_size: int = 10000) -> List[bool]:
+    """Vectorized filtering for speed."""
+    texts = batch["text"]
+    n = len(texts)
+    
+    # Pre-allocate boolean array
+    keep = np.ones(n, dtype=bool)
+    
+    # Vectorized checks
+    for i, text in enumerate(texts):
+        if not text or len(text) < 5:
+            keep[i] = False
+            continue
+        
+        # Fast pattern checks
+        if (PATTERNS["digit"].search(text) or
+            PATTERNS["acronym"].search(text) or
+            PATTERNS["acronym_no_period"].search(text) or
+            PATTERNS["currency"].search(text)):
+            keep[i] = False
+            continue
+        
+        # Ending check
+        if text[-1] not in ".,?!":
+            keep[i] = False
+    
+    return keep.tolist()
+
+
+def preprocess_batch_optimized(
+    batch: Dict,
+    g2p_processor: FastG2PProcessor,
+    fast_tokenizer: FastTokenizer,
+    max_len: int
+) -> Dict[str, List]:
+    """Optimized batch preprocessing with parallel G2P and fast tokenization."""
+    batch_size = len(batch["text"])
+    
+    # Step 1: Parallel G2P processing
+    prompts = []
+    valid_indices = []
+    
+    for i in range(batch_size):
+        phonemes = g2p_processor.process(batch["text"][i])
+        if phonemes is None:
+            continue
+        
+        prompt = fast_tokenizer.build_prompt(phonemes, batch["codes"][i])
+        prompts.append(prompt)
+        valid_indices.append(i)
+    
+    if not prompts:
+        return {
+            "input_ids": [],
+            "labels": [],
+            "attention_mask": [],
+        }
+    
+    # Step 2: Fast batch tokenization
+    tokenized = fast_tokenizer.tokenize_batch(
+        prompts,
+        max_length=max_len,
+        return_labels=True
+    )
+    
+    return tokenized
+
+
+def load_shards_efficient(config: TrainingConfig) -> Dataset:
+    """Load dataset shards efficiently."""
+    if config.use_hf_hub:
+        logger.info(f"Loading from HF Hub: {config.hf_dataset_name}")
+        ds = load_dataset(
+            config.hf_dataset_name,
+            split="train",
+            streaming=False,
+            num_proc=config.num_proc
+        )
+        logger.info(f"Loaded {len(ds):,} examples")
+        return ds
+    
+    # Load local shards
+    shard_files = [
+        f"{config.shard_prefix}-{i:05d}-of-{config.total_shards:05d}.parquet"
+        for i in range(config.start_shard, config.end_shard + 1)
+    ]
+    
+    paths = [Path(config.local_dir) / f for f in shard_files]
+    missing = [p for p in paths if not p.exists()]
+    
+    if missing:
+        logger.error(f"Missing {len(missing)} shard files")
+        raise FileNotFoundError(f"Missing shards in {config.local_dir}")
+    
+    logger.info(f"Loading {len(paths)} local shards")
+    ds = load_dataset(
+        "parquet",
+        data_files=[str(p) for p in paths],
+        split="train",
+        num_proc=config.num_proc
+    )
+    
+    logger.info(f"Loaded {len(ds):,} examples")
+    return ds
+
+
+def setup_model(tokenizer: FastTokenizer, config: TrainingConfig):
+    """Load and setup model."""
+    logger.info(f"Loading model from: {config.restore_from}")
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        config.restore_from,
+        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+        use_cache=not config.gradient_checkpointing,
+    )
+    
+    # Resize embeddings for new tokens
+    model.resize_token_embeddings(len(tokenizer.tokenizer))
+    
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        logger.info("Enabled gradient checkpointing")
+    
+    return model
 
 
 def main(config_path: str):
-    """Main training loop."""
+    """Main training pipeline."""
     # Load config
-    config = OmegaConf.load(config_path)
-    LOGGER.info(f"Loaded config from: {config_path}")
-    
-    # Parse shard range
-    start = int(config.get("data", {}).get("start", 1))
-    end = int(config.get("data", {}).get("end", 19))
-    if end < start:
-        raise ValueError(f"Invalid shard range: start={start}, end={end}")
-    
-    LOGGER.info(f"Training on shards {start} to {end} (inclusive)")
+    omega_cfg = OmegaConf.load(config_path)
+    config = TrainingConfig.from_omega(omega_cfg)
+    logger.info(f"Loaded config from: {config_path}")
+    logger.info(f"Training shards {config.start_shard} to {config.end_shard}")
     
     # Load dataset
-    LOGGER.info("Loading dataset shards...")
-    ds = load_selected_shards(config, start, end)
-    LOGGER.info(f"Loaded {len(ds):,} examples")
+    logger.info("Loading dataset...")
+    ds = load_shards_efficient(config)
     
-    # Filter data
-    LOGGER.info("Filtering dataset...")
+    # Fast filtering
+    logger.info("Filtering dataset...")
     original_size = len(ds)
-    ds = ds.filter(data_filter, num_proc=config.get("num_proc", 8))
-    filtered_size = len(ds)
-    LOGGER.info(f"Filtered: {original_size:,} -> {filtered_size:,} ({filtered_size/original_size*100:.1f}% kept)")
-    
-    # Setup tokenizer and model
-    restore_from = config.get("restore_from")
-    tokenizer, model = setup_tokenizer_and_model(restore_from)
-    
-    # Setup G2P
-    misaki_cfg = config.get("misaki", {}) or {}
-    g2p = build_g2p_from_config(misaki_cfg)
-    
-    # Preprocess dataset with batching
-    LOGGER.info("Preprocessing dataset (this may take a few minutes)...")
-    batch_size = config.get("map_batch_size", 1000)
-    num_proc = config.get("num_proc", 8)
-    
-    preprocess_fn = partial(
-        preprocess_batch,
-        tokenizer=tokenizer,
-        max_len=config.max_seq_len,
-        g2p=g2p
-    )
-    
-    ds = ds.map(
-        preprocess_fn,
+    ds = ds.filter(
+        fast_filter,
         batched=True,
-        batch_size=batch_size,
-        num_proc=num_proc,
-        remove_columns=ds.column_names,
-        desc="Preprocessing"
+        batch_size=config.filter_batch_size,
+        num_proc=config.num_proc,
+        desc="Filtering"
+    )
+    logger.info(
+        f"Filtered: {original_size:,} -> {len(ds):,} "
+        f"({len(ds)/original_size*100:.1f}% kept)"
     )
     
-    LOGGER.info(f"Preprocessed dataset size: {len(ds):,} examples")
+    # Setup processors
+    logger.info("Initializing G2P and tokenizer...")
+    g2p_processor = FastG2PProcessor(config)
+    fast_tokenizer = FastTokenizer(config.restore_from)
     
-    # Setup training
-    checkpoints_dir = os.path.join(config.save_root, config.run_name)
-    LOGGER.info(f"Checkpoints will be saved to: {checkpoints_dir}")
+    # Fast preprocessing
+    logger.info("Preprocessing dataset...")
+    ds = ds.map(
+        lambda batch: preprocess_batch_optimized(
+            batch, g2p_processor, fast_tokenizer, config.max_seq_len
+        ),
+        batched=True,
+        batch_size=config.map_batch_size,
+        num_proc=config.num_proc,
+        remove_columns=ds.column_names,
+        desc="Preprocessing",
+        load_from_cache_file=False,  # Disable cache for consistency
+    )
+    
+    # Remove empty examples
+    ds = ds.filter(lambda x: len(x["input_ids"]) > 0, desc="Removing empty")
+    logger.info(f"Final dataset size: {len(ds):,} examples")
+    
+    if len(ds) == 0:
+        logger.error("No valid examples after preprocessing!")
+        return
+    
+    # Setup model
+    model = setup_model(fast_tokenizer, config)
+    
+    # Training arguments
+    output_dir = Path(config.save_root) / config.run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     training_args = TrainingArguments(
-        output_dir=checkpoints_dir,
+        output_dir=str(output_dir),
         do_train=True,
         learning_rate=config.lr,
         max_steps=config.max_steps,
-        bf16=torch.cuda.is_available(),
+        bf16=config.bf16 and torch.cuda.is_available(),
+        fp16=not config.bf16 and torch.cuda.is_available(),
         per_device_train_batch_size=config.per_device_train_batch_size,
-        gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_ratio=config.warmup_ratio,
         save_steps=config.save_steps,
         logging_steps=config.logging_steps,
         save_strategy="steps",
-        save_total_limit=config.get("save_total_limit", 3),
+        save_total_limit=config.save_total_limit,
         load_best_model_at_end=False,
         dataloader_drop_last=True,
         remove_unused_columns=False,
-        dataloader_num_workers=config.get("dataloader_num_workers", 4),
-        gradient_checkpointing=config.get("gradient_checkpointing", False),
-        optim=config.get("optimizer", "adamw_torch"),
-        lr_scheduler_type=config.get("lr_scheduler_type", "cosine"),
-        report_to=["none"],  # Disable wandb/tensorboard unless configured
+        dataloader_num_workers=config.dataloader_num_workers,
+        optim=config.optimizer,
+        lr_scheduler_type=config.lr_scheduler_type,
+        report_to=["none"],
+        logging_first_step=True,
+        ddp_find_unused_parameters=False,
     )
     
+    # Create trainer
     trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
+        tokenizer=fast_tokenizer.tokenizer,
         args=training_args,
         train_dataset=ds,
-        data_collator=default_data_collator,
+        data_collator=DataCollatorWithPadding(
+            tokenizer=fast_tokenizer.tokenizer,
+            padding="longest",
+        ),
     )
     
-    LOGGER.info("Starting training...")
+    # Train
+    logger.info("Starting training...")
+    logger.info(f"Total steps: {config.max_steps}")
+    logger.info(f"Effective batch size: {config.per_device_train_batch_size * config.gradient_accumulation_steps}")
+    
     trainer.train()
     
     # Save final model
-    final_path = os.path.join(checkpoints_dir, "final")
-    trainer.save_model(final_path)
-    LOGGER.info(f"Training complete! Model saved to: {final_path}")
+    final_path = output_dir / "final"
+    trainer.save_model(str(final_path))
+    logger.info(f"Training complete! Model saved to: {final_path}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python train_with_misaki_shards.py config.yaml")
+        print("Usage: python train_optimized.py config.yaml")
         sys.exit(1)
     
-    cfg_path = sys.argv[1]
-    if not os.path.exists(cfg_path):
-        print(f"Error: Config file not found: {cfg_path}")
+    config_path = sys.argv[1]
+    if not os.path.exists(config_path):
+        print(f"Error: Config file not found: {config_path}")
         sys.exit(1)
     
-    main(cfg_path)
+    main(config_path)

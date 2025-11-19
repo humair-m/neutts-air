@@ -30,7 +30,7 @@ dataloader_num_workers: 8
 # -------------------------------------------------
 data:
   start: 1                # Start shard (inclusive)
-  end: 2                 # End shard (inclusive)
+  end: 1                 # End shard (inclusive)
   total_shards: 241       # Total number of shards in dataset
   prefix: "train"         # Shard prefix
   use_hf_hub: false       # Set to true to download from HF Hub

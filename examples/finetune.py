@@ -8,6 +8,7 @@ High-performance training script with:
 - Efficient memory management
 - Progress tracking
 - LIMITED TO FIRST 500 ROWS FOR QUICK TESTING
+- Prints first example verification
 
 Usage:
     python train_optimized.py config.yaml
@@ -490,6 +491,53 @@ def main(config_path: str):
     logger.info("Preprocessing dataset (single process for stability)...")
     ds = preprocess_dataset_optimized(ds, g2p_processor, fast_tokenizer, config)
     logger.info(f"Final dataset size: {len(ds):,} examples")
+    
+    # Print first example for verification
+    if len(ds) > 0:
+        logger.info("\n" + "="*80)
+        logger.info("FIRST EXAMPLE VERIFICATION")
+        logger.info("="*80)
+        
+        first_example = ds[0]
+        
+        # Decode tokenized version
+        input_ids = first_example["input_ids"]
+        labels = first_example["labels"]
+        attention_mask = first_example["attention_mask"]
+        
+        decoded_input = fast_tokenizer.tokenizer.decode(input_ids, skip_special_tokens=False)
+        
+        # Decode labels (replace -100 with pad token for display)
+        labels_for_display = [tid if tid != -100 else fast_tokenizer.pad_id for tid in labels]
+        decoded_labels = fast_tokenizer.tokenizer.decode(labels_for_display, skip_special_tokens=False)
+        
+        logger.info(f"\n📝 UNTOKENIZED (Decoded from tokens):")
+        logger.info(f"{decoded_input[:500]}...")  # Show first 500 chars
+        
+        logger.info(f"\n🔢 TOKENIZED (Input IDs):")
+        logger.info(f"Length: {len(input_ids)}")
+        logger.info(f"First 50 tokens: {input_ids[:50]}")
+        
+        logger.info(f"\n🎯 LABELS (first 50):")
+        logger.info(f"{labels[:50]}")
+        
+        logger.info(f"\n👁️ ATTENTION MASK (first 50):")
+        logger.info(f"{attention_mask[:50]}")
+        
+        logger.info(f"\n📊 DECODED LABELS:")
+        logger.info(f"{decoded_labels[:500]}...")  # Show first 500 chars
+        
+        # Count non-padding tokens
+        num_real_tokens = sum(1 for m in attention_mask if m == 1)
+        num_label_tokens = sum(1 for l in labels if l != -100)
+        
+        logger.info(f"\n📈 STATISTICS:")
+        logger.info(f"  - Total sequence length: {len(input_ids)}")
+        logger.info(f"  - Real tokens (non-padding): {num_real_tokens}")
+        logger.info(f"  - Label tokens (non -100): {num_label_tokens}")
+        logger.info(f"  - Padding tokens: {len(input_ids) - num_real_tokens}")
+        
+        logger.info("="*80 + "\n")
 
     # Setup model
     model = setup_model(fast_tokenizer, config)

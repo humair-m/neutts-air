@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # Run info
 # -------------------------------------------------
-restore_from: "HuggingFaceTB/SmolLM-135M"
+restore_from: "PleIAs/Monad"
 save_root: "/data"
 run_name: "neutts-finetune"
 

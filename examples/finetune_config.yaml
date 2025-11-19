@@ -18,7 +18,7 @@ use_fp16: true
 # -------------------------------------------------
 # Train info
 # -------------------------------------------------
-per_device_train_batch_size: 2
+per_device_train_batch_size: 16
 max_steps: 10000
 logging_steps: 1
 save_steps: 500

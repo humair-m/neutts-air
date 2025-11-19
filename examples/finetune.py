@@ -128,7 +128,7 @@ class TrainingConfig:
             lr=float(cfg.get("lr", 5e-5)),
             max_steps=int(cfg.get("max_steps", 10000)),
             per_device_train_batch_size=int(cfg.get("per_device_train_batch_size", 4)),
-            gradient_accumulation_steps=int(cfg.get("gradient_accumulation_steps", 4)),
+            gradient_accumulation_steps=int(cfg.get("gradient_accumulation_steps", 8)),
             warmup_ratio=float(cfg.get("warmup_ratio", 0.1)),
             save_steps=int(cfg.get("save_steps", 500)),
             logging_steps=int(cfg.get("logging_steps", 10)),

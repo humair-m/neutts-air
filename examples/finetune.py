@@ -57,7 +57,7 @@ PATTERNS = {
 }
 
 # MAXIMUM ROWS TO PROCESS
-MAX_ROWS = 500
+MAX_ROWS = 25000
 
 
 @dataclass

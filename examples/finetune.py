@@ -380,7 +380,7 @@ def load_shards_efficient(config: TrainingConfig) -> Dataset:
         logger.info(f"Loading from HF Hub: {config.hf_dataset_name}")
         ds = load_dataset(
             config.hf_dataset_name,
-            split="train",
+            split="train[:2000]",
             streaming=False,
         )
         logger.info(f"Loaded {len(ds):,} examples")

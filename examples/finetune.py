@@ -9,14 +9,14 @@ High-performance training script with:
 - Progress tracking
 
 Usage:
-    python train_optimized.py config.yaml
+    python train_optimized.py config.yaml 
 """
 import os
 import re
 import sys
 import shutil
 import warnings
-from pathlib import Path
+from pathlib import Path 
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 
@@ -419,7 +419,7 @@ def setup_model(tokenizer: FastTokenizer, config: TrainingConfig):
     model = AutoModelForCausalLM.from_pretrained(
         config.restore_from,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+      #  attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
         use_cache=not config.gradient_checkpointing,
     )
     

@@ -405,7 +405,7 @@ def load_shards_efficient(config: TrainingConfig) -> Dataset:
     ds = load_dataset(
         "parquet",
         data_files=[str(p) for p in paths],
-        split="train",
+        split="train[:2000}",
     )
     
     logger.info(f"Loaded {len(ds):,} examples")

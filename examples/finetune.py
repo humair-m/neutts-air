@@ -198,35 +198,7 @@ class FastG2PProcessor:
                     fallback = misaki_espeak.EspeakFallback(
                         british=self.config.british_english, program_name=bin_name
                     )
-                    logger.info(f"Training complete! Model saved to: {final_path}")
-    
-    # Push final model to HF Hub if configured
-    if config.hf_hub_repo and config.hf_token:
-        logger.info(f"📤 Pushing final model to HF Hub: {config.hf_hub_repo}/final...")
-        try:
-            api = HfApi(token=config.hf_token)
-            api.upload_folder(
-                folder_path=str(final_path),
-                repo_id=config.hf_hub_repo,
-                path_in_repo="final",
-                commit_message="Upload final trained model"
-            )
-            logger.info(f"✓ Successfully pushed final model to {config.hf_hub_repo}/final")
-        except Exception as e:
-            logger.error(f"Failed to push final model: {e}")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python train_optimized.py config.yaml")
-        sys.exit(1)
-
-    config_path = sys.argv[1]
-    if not os.path.exists(config_path):
-        print(f"Error: Config file not found: {config_path}")
-        sys.exit(1)
-
-    main(config_path)f"Enabled espeak fallback: {bin_name}")
+                    logger.info(f"Enabled espeak fallback: {bin_name}")
             except Exception as e:
                 logger.warning(f"Espeak fallback failed: {e}")
 
@@ -803,7 +775,6 @@ def main(config_path: str):
             logger.error(f"Failed to push final model: {e}")
 
 
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python train_optimized.py config.yaml")
@@ -815,4 +786,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     main(config_path)
-        
+    

@@ -24,18 +24,45 @@ logging_steps: 1
 save_steps: 500
 seed: 1337
 dataloader_num_workers: 16
+gradient_checkpointing: true
+bf16: true
+gradient_accumulation_steps: 4
+optimizer: "adamw_torch"
+save_total_limit: 3
 
 # -------------------------------------------------
 # Dataset configuration
 # -------------------------------------------------
 data:
   start: 1                # Start shard (inclusive)
-  end: 1                 # End shard (inclusive)
+  end: 1                  # End shard (inclusive)
   total_shards: 241       # Total number of shards in dataset
   prefix: "train"         # Shard prefix
   use_hf_hub: false       # Set to true to download from HF Hub
   local_dir: "./data"     # Local directory containing parquet shards
-  # hf_base: "https://huggingface.co/datasets/neuphonic/emilia-yodas-english-neucodec/resolve/main"
+  # hf_dataset_name: "neuphonic/emilia-yodas-english-neucodec"  # Uncomment if using HF Hub
+
+# -------------------------------------------------
+# Validation configuration (optional)
+# -------------------------------------------------
+validation:
+  eval_steps: 200         # Run validation every N steps (set to null to disable)
+  max_samples: 500        # Maximum validation samples to use
+  start: 2                # Validation shard start (can be different from training)
+  end: 2                  # Validation shard end
+  local_dir: "./data"     # Local directory for validation shards
+  use_hf_hub: false       # Set to true to use HF Hub for validation
+  # hf_dataset_name: "neuphonic/emilia-yodas-english-neucodec"  # Uncomment if using HF Hub
+
+# -------------------------------------------------
+# HuggingFace Hub configuration
+# -------------------------------------------------
+huggingface:
+  repo: "humair025/TTS"   # Your HF Hub repository (format: username/repo-name)
+  push_steps: 200         # Push model to HF Hub every N steps (set to null to disable)
+  token: null             # HF token (or set HF_TOKEN environment variable)
+  resume_from_latest: false  # If true, automatically resume from latest checkpoint in HF repo
+  # To set token via environment: export HF_TOKEN="hf_..."
 
 # -------------------------------------------------
 # Misaki G2P configuration

@@ -7,6 +7,8 @@ High-performance training script with:
 - Single-process optimization (avoids pickling issues)
 - Efficient memory management
 - Progress tracking
+- Optional validation dataset
+- Auto-push to HuggingFace Hub
 - LIMITED TO FIRST 500 ROWS FOR QUICK TESTING
 - Prints first example verification
 
@@ -36,10 +38,12 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorWithPadding,
+    TrainerCallback,
 )
 from datasets import load_dataset, Dataset
 from tqdm.auto import tqdm
 import numpy as np
+from huggingface_hub import HfApi, create_repo, list_repo_files
 
 # Misaki G2P
 try:
@@ -72,6 +76,15 @@ class TrainingConfig:
     local_dir: Optional[str] = None
     hf_dataset_name: Optional[str] = None
     use_hf_hub: bool = False
+    
+    # Validation
+    val_start_shard: Optional[int] = None
+    val_end_shard: Optional[int] = None
+    val_local_dir: Optional[str] = None
+    val_hf_dataset_name: Optional[str] = None
+    use_val_hf_hub: bool = False
+    eval_steps: Optional[int] = None
+    max_val_samples: int = 500
 
     # Model
     restore_from: str = None
@@ -98,6 +111,11 @@ class TrainingConfig:
     dataloader_num_workers: int = 4
     optimizer: str = "adamw_torch"
     lr_scheduler_type: str = "cosine"
+    
+    # HuggingFace Hub
+    hf_hub_repo: Optional[str] = None
+    hf_push_steps: Optional[int] = None
+    hf_token: Optional[str] = None
 
     # G2P
     use_transformer_g2p: bool = False
@@ -108,7 +126,9 @@ class TrainingConfig:
     def from_omega(cls, cfg: OmegaConf):
         """Create from OmegaConf."""
         data_cfg = cfg.get("data", {})
+        val_cfg = cfg.get("validation", {})
         misaki_cfg = cfg.get("misaki", {})
+        hf_cfg = cfg.get("huggingface", {})
 
         return cls(
             start_shard=int(data_cfg.get("start", 1)),
@@ -118,6 +138,15 @@ class TrainingConfig:
             local_dir=data_cfg.get("local_dir"),
             hf_dataset_name=data_cfg.get("hf_dataset_name"),
             use_hf_hub=bool(data_cfg.get("use_hf_hub", False)),
+            
+            val_start_shard=val_cfg.get("start"),
+            val_end_shard=val_cfg.get("end"),
+            val_local_dir=val_cfg.get("local_dir"),
+            val_hf_dataset_name=val_cfg.get("hf_dataset_name"),
+            use_val_hf_hub=bool(val_cfg.get("use_hf_hub", False)),
+            eval_steps=val_cfg.get("eval_steps"),
+            max_val_samples=int(val_cfg.get("max_samples", 500)),
+            
             restore_from=cfg.get("restore_from"),
             max_seq_len=int(cfg.get("max_seq_len", 2048)),
             num_proc=int(cfg.get("num_proc", 8)),
@@ -138,6 +167,11 @@ class TrainingConfig:
             dataloader_num_workers=int(cfg.get("dataloader_num_workers", 4)),
             optimizer=cfg.get("optimizer", "adamw_torch"),
             lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine"),
+            
+            hf_hub_repo=hf_cfg.get("repo"),
+            hf_push_steps=hf_cfg.get("push_steps"),
+            hf_token=hf_cfg.get("token") or os.environ.get("HF_TOKEN"),
+            
             use_transformer_g2p=bool(misaki_cfg.get("use_transformer", False)),
             british_english=bool(misaki_cfg.get("british", False)),
             use_espeak_fallback=bool(misaki_cfg.get("fallback") == "espeak"),
@@ -164,7 +198,35 @@ class FastG2PProcessor:
                     fallback = misaki_espeak.EspeakFallback(
                         british=self.config.british_english, program_name=bin_name
                     )
-                    logger.info(f"Enabled espeak fallback: {bin_name}")
+                    logger.info(f"Training complete! Model saved to: {final_path}")
+    
+    # Push final model to HF Hub if configured
+    if config.hf_hub_repo and config.hf_token:
+        logger.info(f"📤 Pushing final model to HF Hub: {config.hf_hub_repo}/final...")
+        try:
+            api = HfApi(token=config.hf_token)
+            api.upload_folder(
+                folder_path=str(final_path),
+                repo_id=config.hf_hub_repo,
+                path_in_repo="final",
+                commit_message="Upload final trained model"
+            )
+            logger.info(f"✓ Successfully pushed final model to {config.hf_hub_repo}/final")
+        except Exception as e:
+            logger.error(f"Failed to push final model: {e}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python train_optimized.py config.yaml")
+        sys.exit(1)
+
+    config_path = sys.argv[1]
+    if not os.path.exists(config_path):
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+
+    main(config_path)f"Enabled espeak fallback: {bin_name}")
             except Exception as e:
                 logger.warning(f"Espeak fallback failed: {e}")
 
@@ -387,43 +449,64 @@ def preprocess_dataset_optimized(
     return Dataset.from_list(all_results)
 
 
-def load_shards_efficient(config: TrainingConfig) -> Dataset:
+def load_shards_efficient(
+    config: TrainingConfig, 
+    is_validation: bool = False,
+    max_samples: Optional[int] = None
+) -> Dataset:
     """Load dataset shards efficiently - LIMITED TO FIRST 500 ROWS."""
-    logger.warning(f"⚠️  LIMITING DATASET TO FIRST {MAX_ROWS} ROWS FOR TESTING ⚠️")
+    if max_samples is None:
+        max_samples = MAX_ROWS if not is_validation else config.max_val_samples
+    
+    dataset_type = "validation" if is_validation else "training"
+    logger.warning(f"⚠️  LIMITING {dataset_type.upper()} DATASET TO FIRST {max_samples} ROWS ⚠️")
 
-    if config.use_hf_hub:
-        logger.info(f"Loading from HF Hub: {config.hf_dataset_name}")
+    if is_validation:
+        use_hf = config.use_val_hf_hub
+        hf_name = config.val_hf_dataset_name
+        local_dir = config.val_local_dir
+        start_shard = config.val_start_shard
+        end_shard = config.val_end_shard
+    else:
+        use_hf = config.use_hf_hub
+        hf_name = config.hf_dataset_name
+        local_dir = config.local_dir
+        start_shard = config.start_shard
+        end_shard = config.end_shard
+
+    if use_hf:
+        logger.info(f"Loading {dataset_type} from HF Hub: {hf_name}")
         ds = load_dataset(
-            config.hf_dataset_name,
-            split=f"train[:{MAX_ROWS}]",
+            hf_name,
+            split=f"train[:{max_samples}]",
             streaming=False,
         )
-        logger.info(f"Loaded {len(ds):,} examples (limited to {MAX_ROWS})")
+        logger.info(f"Loaded {len(ds):,} {dataset_type} examples (limited to {max_samples})")
         return ds
 
     # Load local shards
     shard_files = [
         f"{config.shard_prefix}-{i:05d}-of-{config.total_shards:05d}.parquet"
-        for i in range(config.start_shard, config.end_shard + 1)
+        for i in range(start_shard, end_shard + 1)
     ]
 
-    paths = [Path(config.local_dir) / f for f in shard_files]
+    paths = [Path(local_dir) / f for f in shard_files]
     missing = [p for p in paths if not p.exists()]
 
     if missing:
-        logger.error(f"Missing {len(missing)} shard files")
+        logger.error(f"Missing {len(missing)} {dataset_type} shard files")
         for p in missing[:5]:
             logger.error(f"  - {p}")
-        raise FileNotFoundError(f"Missing shards in {config.local_dir}")
+        raise FileNotFoundError(f"Missing {dataset_type} shards in {local_dir}")
 
-    logger.info(f"Loading {len(paths)} local shards (first {MAX_ROWS} rows only)")
+    logger.info(f"Loading {len(paths)} local {dataset_type} shards (first {max_samples} rows only)")
     ds = load_dataset(
         "parquet",
         data_files=[str(p) for p in paths],
-        split=f"train[:{MAX_ROWS}]",
+        split=f"train[:{max_samples}]",
     )
 
-    logger.info(f"Loaded {len(ds):,} examples (limited to {MAX_ROWS})")
+    logger.info(f"Loaded {len(ds):,} {dataset_type} examples (limited to {max_samples})")
     return ds
 
 
@@ -448,6 +531,70 @@ def setup_model(tokenizer: FastTokenizer, config: TrainingConfig):
     return model
 
 
+class HuggingFacePushCallback(TrainerCallback):
+    """Callback to push model to HuggingFace Hub at specified intervals."""
+    
+    def __init__(self, config: TrainingConfig, tokenizer: FastTokenizer):
+        self.config = config
+        self.tokenizer = tokenizer
+        self.api = None
+        
+        if config.hf_hub_repo and config.hf_push_steps:
+            if not config.hf_token:
+                logger.warning("HF_TOKEN not found. Set it via config or environment variable.")
+            else:
+                logger.info(f"Will push to HF Hub: {config.hf_hub_repo} every {config.hf_push_steps} steps")
+                self.api = HfApi(token=config.hf_token)
+                
+                # Create repo if it doesn't exist
+                try:
+                    create_repo(
+                        config.hf_hub_repo,
+                        token=config.hf_token,
+                        exist_ok=True,
+                        private=False
+                    )
+                    logger.info(f"✓ Repository ready: {config.hf_hub_repo}")
+                except Exception as e:
+                    logger.error(f"Failed to create/access repo: {e}")
+                    self.api = None
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Push to Hub at specified intervals."""
+        if not self.api or not self.config.hf_push_steps:
+            return
+        
+        current_step = state.global_step
+        
+        if current_step > 0 and current_step % self.config.hf_push_steps == 0:
+            logger.info(f"📤 Pushing model to HF Hub at step {current_step}...")
+            
+            try:
+                model = kwargs.get("model")
+                
+                # Create step directory
+                step_dir = f"step_{current_step}"
+                save_path = Path(args.output_dir) / step_dir
+                save_path.mkdir(parents=True, exist_ok=True)
+                
+                # Save model and tokenizer locally first
+                model.save_pretrained(str(save_path))
+                self.tokenizer.tokenizer.save_pretrained(str(save_path))
+                
+                # Push to Hub
+                self.api.upload_folder(
+                    folder_path=str(save_path),
+                    repo_id=self.config.hf_hub_repo,
+                    path_in_repo=step_dir,
+                    commit_message=f"Upload model at step {current_step}"
+                )
+                
+                logger.info(f"✓ Successfully pushed to {self.config.hf_hub_repo}/{step_dir}")
+                
+            except Exception as e:
+                logger.error(f"Failed to push to HF Hub: {e}")
+
+
 def main(config_path: str):
     """Main training pipeline."""
     # Load config
@@ -459,11 +606,11 @@ def main(config_path: str):
     logger.warning(f"⚠️  DATASET LIMITED TO {MAX_ROWS} ROWS ⚠️")
 
     # Load dataset (first 500 rows only)
-    logger.info("Loading dataset...")
-    ds = load_shards_efficient(config)
+    logger.info("Loading training dataset...")
+    ds = load_shards_efficient(config, is_validation=False)
 
     # Fast filtering
-    logger.info("Filtering dataset...")
+    logger.info("Filtering training dataset...")
     original_size = len(ds)
     ds = ds.filter(
         fast_filter,
@@ -488,9 +635,37 @@ def main(config_path: str):
     fast_tokenizer = FastTokenizer(config.restore_from)
 
     # Optimized preprocessing (single process to avoid pickling)
-    logger.info("Preprocessing dataset (single process for stability)...")
+    logger.info("Preprocessing training dataset (single process for stability)...")
     ds = preprocess_dataset_optimized(ds, g2p_processor, fast_tokenizer, config)
-    logger.info(f"Final dataset size: {len(ds):,} examples")
+    logger.info(f"Final training dataset size: {len(ds):,} examples")
+    
+    # Load and preprocess validation dataset if configured
+    eval_dataset = None
+    if config.eval_steps and (config.val_local_dir or config.val_hf_dataset_name):
+        logger.info("Loading validation dataset...")
+        val_ds = load_shards_efficient(config, is_validation=True)
+        
+        logger.info("Filtering validation dataset...")
+        val_original_size = len(val_ds)
+        val_ds = val_ds.filter(
+            fast_filter,
+            batched=True,
+            batch_size=config.filter_batch_size,
+            num_proc=config.num_proc,
+            desc="Filtering validation",
+        )
+        
+        logger.info(
+            f"Filtered validation: {val_original_size:,} -> {len(val_ds):,} "
+            f"({len(val_ds)/val_original_size*100:.1f}% kept)"
+        )
+        
+        if len(val_ds) > 0:
+            logger.info("Preprocessing validation dataset...")
+            eval_dataset = preprocess_dataset_optimized(val_ds, g2p_processor, fast_tokenizer, config)
+            logger.info(f"Final validation dataset size: {len(eval_dataset):,} examples")
+        else:
+            logger.warning("No validation examples after filtering. Skipping validation.")
     
     # Print first example for verification
     if len(ds) > 0:
@@ -549,11 +724,15 @@ def main(config_path: str):
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         do_train=True,
+        do_eval=eval_dataset is not None,
+        evaluation_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=config.eval_steps if eval_dataset is not None else None,
         learning_rate=config.lr,
         max_steps=config.max_steps,
         bf16=config.bf16 and torch.cuda.is_available(),
         fp16=not config.bf16 and torch.cuda.is_available(),
         per_device_train_batch_size=config.per_device_train_batch_size,
+        per_device_eval_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_ratio=config.warmup_ratio,
         save_steps=config.save_steps,
@@ -571,16 +750,20 @@ def main(config_path: str):
         ddp_find_unused_parameters=False,
     )
 
-    # Create trainer
+    # Create trainer with callback
+    hf_callback = HuggingFacePushCallback(config, fast_tokenizer)
+    
     trainer = Trainer(
         model=model,
         tokenizer=fast_tokenizer.tokenizer,
         args=training_args,
         train_dataset=ds,
+        eval_dataset=eval_dataset,
         data_collator=DataCollatorWithPadding(
             tokenizer=fast_tokenizer.tokenizer,
             padding="longest",
         ),
+        callbacks=[hf_callback],
     )
 
     # Train
@@ -590,6 +773,10 @@ def main(config_path: str):
         f"Effective batch size: "
         f"{config.per_device_train_batch_size * config.gradient_accumulation_steps}"
     )
+    if eval_dataset:
+        logger.info(f"Validation will run every {config.eval_steps} steps")
+    if config.hf_hub_repo and config.hf_push_steps:
+        logger.info(f"Model will be pushed to {config.hf_hub_repo} every {config.hf_push_steps} steps")
 
     trainer.train()
 
@@ -599,6 +786,22 @@ def main(config_path: str):
     fast_tokenizer.tokenizer.save_pretrained(str(final_path))
 
     logger.info(f"Training complete! Model saved to: {final_path}")
+    
+    # Push final model to HF Hub if configured
+    if config.hf_hub_repo and config.hf_token:
+        logger.info(f"📤 Pushing final model to HF Hub: {config.hf_hub_repo}/final...")
+        try:
+            api = HfApi(token=config.hf_token)
+            api.upload_folder(
+                folder_path=str(final_path),
+                repo_id=config.hf_hub_repo,
+                path_in_repo="final",
+                commit_message="Upload final trained model"
+            )
+            logger.info(f"✓ Successfully pushed final model to {config.hf_hub_repo}/final")
+        except Exception as e:
+            logger.error(f"Failed to push final model: {e}")
+
 
 
 if __name__ == "__main__":
@@ -612,3 +815,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     main(config_path)
+        

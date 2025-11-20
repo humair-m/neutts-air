@@ -697,7 +697,7 @@ def main(config_path: str):
         output_dir=str(output_dir),
         do_train=True,
         do_eval=eval_dataset is not None,
-        evaluation_strategy="steps" if eval_dataset is not None else "no",
+        eval_strategy="steps" if eval_dataset is not None else "no",
         eval_steps=config.eval_steps if eval_dataset is not None else None,
         learning_rate=config.lr,
         max_steps=config.max_steps,
